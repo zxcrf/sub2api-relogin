@@ -12,6 +12,8 @@ const LISTEN_HOST = process.env.RELOGIN_LISTEN_HOST || "127.0.0.1";
 const LISTEN_PORT = Number(process.env.RELOGIN_LISTEN_PORT || 18790);
 const TOSUB2_ROOT = process.env.TOSUB2_ROOT || "/opt/tosub2";
 const EGRESS_PROXY = (process.env.RELOGIN_EGRESS_PROXY || "").trim();
+// on（默认）：登录走该账号在 sub2api 里配置的代理，和日常使用同一个出口 IP；off：一律从本机出口直连。
+const ACCOUNT_PROXY = (process.env.RELOGIN_ACCOUNT_PROXY || "on").trim().toLowerCase() !== "off";
 const MAX_CONCURRENT = Number(process.env.RELOGIN_MAX_CONCURRENT || 2);
 const LOGIN_TIMEOUT_MS = Number(process.env.RELOGIN_TIMEOUT_SECONDS || 600) * 1000;
 const HEARTBEAT_MS = 15_000;
@@ -117,7 +119,55 @@ function classifyFailure(output, exitCode, timedOut) {
   return { code: exitCode === 0 ? "incomplete_credentials" : "relogin_failed", stage };
 }
 
-function runLogin({ email, password, mfaSecret }, signal) {
+// 向 egress 申请这次登录的出网路由：egress 按邮箱查 sub2api 里该账号的代理，返回一个路由号。
+// 登录子进程只拿到「egress + 路由号」，看不到账号代理本身的地址和密码。
+async function createRoute(email) {
+  let res;
+  try {
+    res = await fetch(new URL("/routes", EGRESS_PROXY), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ email, mode: ACCOUNT_PROXY ? "account" : "direct" }),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch {
+    return { ok: false, code: "egress_unreachable" };
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !/^[0-9a-f]{32}$/.test(String(body.route || ""))) {
+    return { ok: false, code: String(body?.error?.code || "account_proxy_lookup_failed") };
+  }
+  const proxy = new URL(EGRESS_PROXY);
+  proxy.username = "route";
+  proxy.password = body.route;
+  return { ok: true, id: body.route, proxy: proxy.toString(), mode: body.mode, reason: body.reason, via: body.via };
+}
+
+function deleteRoute(id) {
+  fetch(new URL(`/routes/${id}`, EGRESS_PROXY), {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${TOKEN}` },
+    signal: AbortSignal.timeout(10_000),
+  }).catch(() => {});
+}
+
+async function runLogin(job, signal) {
+  if (!EGRESS_PROXY) return spawnLogin(job, null, signal);
+  const route = await createRoute(job.email);
+  if (!route.ok) return { ok: false, code: route.code, stage: "proxy_lookup" };
+  if (signal.aborted) {
+    deleteRoute(route.id);
+    return { ok: false, code: "cancelled", stage: "proxy_lookup" };
+  }
+  log({ event: "relogin_route", email: job.tag, mode: route.mode, reason: route.reason, via: route.via });
+  try {
+    return await spawnLogin(job, route.proxy, signal);
+  } finally {
+    deleteRoute(route.id);
+  }
+}
+
+function spawnLogin({ email, password, mfaSecret }, proxy, signal) {
   return new Promise(async (resolve) => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "relogin-"));
     await fs.chmod(dir, 0o700);
@@ -129,7 +179,7 @@ function runLogin({ email, password, mfaSecret }, signal) {
       "--sub2api-out", outFile,
       "--sub2api-name", "relogin",
     ];
-    if (EGRESS_PROXY) args.push("--proxy", EGRESS_PROXY);
+    if (proxy) args.push("--proxy", proxy);
     // 子进程只拿到它需要的变量：不继承本服务的令牌和其它环境。
     const env = {
       PATH: process.env.PATH,
@@ -262,7 +312,7 @@ function startJob({ email, password, mfaSecret, secretHash, tag }) {
   inflight.set(email, job);
   const started = Date.now();
   log({ event: "relogin_start", email: tag, totp: Boolean(mfaSecret) });
-  job.promise = runLogin({ email, password, mfaSecret }, job.controller.signal).then((result) => {
+  job.promise = runLogin({ email, password, mfaSecret, tag }, job.controller.signal).then((result) => {
     const elapsed = Date.now() - started;
     if (result.ok) {
       log({ event: "relogin_done", email: tag, ok: true, elapsed_ms: elapsed });
@@ -305,7 +355,8 @@ const server = http.createServer(async (req, res) => {
 server.requestTimeout = 0;
 server.headersTimeout = 10_000;
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  log({ event: "listening", host: LISTEN_HOST, port: LISTEN_PORT, egress_proxy: Boolean(EGRESS_PROXY) });
+  log({ event: "listening", host: LISTEN_HOST, port: LISTEN_PORT, egress_proxy: Boolean(EGRESS_PROXY),
+    account_proxy: Boolean(EGRESS_PROXY) && ACCOUNT_PROXY });
 });
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.on(signal, () => server.close(() => process.exit(0)));

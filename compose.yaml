@@ -1,5 +1,6 @@
-# sub2api 自托管重登服务。relogin 在无出网路由的内部网络里，只能经 egress（主机名白名单代理）访问 OpenAI。
-# 可用 .env 覆盖：RELOGIN_SUBNET、RELOGIN_IP、RELOGIN_TOKEN_PATH（见 .env.example）。
+# sub2api 自托管重登服务。relogin 在无出网路由的内部网络里，只能经 egress（主机名白名单代理）访问 OpenAI；
+# egress 按邮箱到 sub2api 查该账号配置的代理，把这次登录的流量接到那个代理上。
+# 可用 .env 覆盖的项见 .env.example。
 name: sub2api-relogin
 services:
   relogin:
@@ -13,6 +14,7 @@ services:
       RELOGIN_LISTEN_PORT: "18790"
       RELOGIN_TOKEN_FILE: /run/secrets/relogin-token
       RELOGIN_EGRESS_PROXY: http://egress:8888
+      RELOGIN_ACCOUNT_PROXY: ${RELOGIN_ACCOUNT_PROXY:-on}
       RELOGIN_MAX_CONCURRENT: "2"
       RELOGIN_TIMEOUT_SECONDS: "600"
       PYTHONDONTWRITEBYTECODE: "1"
@@ -30,6 +32,16 @@ services:
   egress:
     build: ./egress
     restart: unless-stopped
+    environment:
+      EGRESS_TOKEN_FILE: /run/secrets/relogin-token
+      SUB2API_BASE_URL: ${SUB2API_BASE_URL:-}
+      SUB2API_ADMIN_KEY_FILE: /run/secrets/sub2api-admin-key
+    volumes:
+      - ${RELOGIN_TOKEN_PATH:-/etc/sub2api-relogin/token}:/run/secrets/relogin-token:ro
+      # sub2api 的 Admin API Key 只挂给 egress；跑登录的 relogin 容器拿不到
+      - ${SUB2API_ADMIN_KEY_PATH:-/etc/sub2api-relogin/sub2api-admin-key}:/run/secrets/sub2api-admin-key:ro
+    extra_hosts:
+      - host.docker.internal:host-gateway
     networks:
       relogin-int: {}
       relogin-out: {}
@@ -38,7 +50,7 @@ services:
       - /tmp:size=8m
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    mem_limit: 64m
+    mem_limit: 128m
     cpus: 0.5
 networks:
   relogin-int:
@@ -46,4 +58,8 @@ networks:
     ipam:
       config:
         - subnet: ${RELOGIN_SUBNET:-172.31.250.0/24}
-  relogin-out: {}
+  # egress 的出网网络。网段固定下来，宿主机防火墙才能按网段放行 egress 访问本机的 sub2api
+  relogin-out:
+    ipam:
+      config:
+        - subnet: ${RELOGIN_OUT_SUBNET:-172.31.249.0/24}
