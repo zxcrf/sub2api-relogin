@@ -159,6 +159,10 @@ let egress;
 before(async () => {
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), "relogin-test-"));
   const targetPort = await listen(net.createServer(echo));
+  // 同一端口在 ::1 上也开一个，用来看直连时选了哪个地址族
+  const v6 = net.createServer(echo);
+  servers.push(v6);
+  await new Promise((resolve) => v6.listen({ port: targetPort, host: "::1", ipv6Only: true }, resolve));
   await fs.writeFile(PROBE_FILE, `localhost:${targetPort}`);
   const httpPort = await fakeHttpProxy();
   const socksPort = await fakeSocksProxy();
@@ -242,6 +246,14 @@ test("账号没配代理、或 sub2api 里没有这个账号：直连", async ()
   assert.equal((await relogin("new@x.test")).status, "succeeded");
   assert.equal(lastRouteLog().reason, "account_not_found");
   assert.equal(seen.http.length + seen.socks.length, before);
+});
+
+test("直连按 Go 的规则选地址族：有 IPv6 路由就先走 IPv6", async () => {
+  const before = egress.logs.length;
+  assert.equal((await relogin("c@x.test")).status, "succeeded");
+  const opened = egress.logs.slice(before).filter((l) => l.event === "tunnel_open" && l.via === "direct");
+  assert.ok(opened.length > 0);
+  assert.deepEqual([...new Set(opened.map((l) => l.family))], ["IPv6"]);
 });
 
 test("同名账号代理不同：拒绝登录，不猜", async () => {

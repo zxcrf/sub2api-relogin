@@ -7,6 +7,7 @@ set -u
 cd "$(dirname "$0")"
 [ -f .env ] && . ./.env
 IP=${RELOGIN_IP:-172.31.250.10}
+GW=${RELOGIN_GATEWAY:-172.31.250.1}
 TOKEN_PATH=${RELOGIN_TOKEN_PATH:-/etc/sub2api-relogin/token}
 BASE="http://$IP:18790"
 fail=0
@@ -19,12 +20,14 @@ check "读取令牌文件 $TOKEN_PATH" "$([ -n "$TOKEN" ] && echo ok)" ok
 check "带令牌访问测活接口" "$(curl -s --max-time 5 -H "Authorization: Bearer $TOKEN" -X POST "$BASE/api/v1/relogin/probe" -d '{}')" '{"status":"active","mode":"passive"}'
 
 ACCOUNT_PROXY=${RELOGIN_ACCOUNT_PROXY:-on}
-docker compose exec -T -e ACCOUNT_PROXY="$ACCOUNT_PROXY" relogin python3 - "$@" <<'PY' || fail=1
+# 宿主机自己访问 OpenAI 的出口 IP（sub2api 没配代理的账号就是从这里出去的）
+HOST_EXIT=$(curl -s --max-time 10 https://chatgpt.com/cdn-cgi/trace | sed -n 's/^ip=//p')
+docker compose exec -T -e ACCOUNT_PROXY="$ACCOUNT_PROXY" -e EGRESS="http://$GW:8888" -e HOST_EXIT="$HOST_EXIT" relogin python3 - "$@" <<'PY' || fail=1
 import json, os, socket, sys, urllib.error, urllib.request
 TOKEN = open("/run/secrets/relogin-token").read().strip()
 direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def route(email, mode):
-    req = urllib.request.Request("http://egress:8888/routes", method="POST",
+    req = urllib.request.Request(os.environ["EGRESS"] + "/routes", method="POST",
         data=json.dumps({"email": email, "mode": mode}).encode(),
         headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"})
     try:
@@ -34,8 +37,9 @@ def route(email, mode):
     except Exception as e:
         return {"error": {"code": "egress_unreachable: " + str(e)[:80]}}
 r = route("relogin-selfcheck@example.invalid", "direct")
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({"https": "http://route:%s@egress:8888" % r.get("route", "none")}))
-noroute = urllib.request.build_opener(urllib.request.ProxyHandler({"https": "http://egress:8888"}))
+EGRESS_HOSTPORT = os.environ["EGRESS"].split("//", 1)[1]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({"https": "http://route:%s@%s" % (r.get("route", "none"), EGRESS_HOSTPORT)}))
+noroute = urllib.request.build_opener(urllib.request.ProxyHandler({"https": os.environ["EGRESS"]}))
 def via_proxy(url, opener=opener):
     try:
         opener.open(url, timeout=15)
@@ -59,6 +63,13 @@ for host in ("chatgpt.com", "auth.openai.com", "sentinel.openai.com"):
 for host in ("example.com", "session.ameng2027.xyz"):
     check(f"经代理拒绝 {host}", via_proxy(f"https://{host}/"), "filtered")
 check("不带路由的隧道被拒绝", via_proxy("https://chatgpt.com/", noroute), "no_route")
+# 直连出口必须和宿主机（sub2api）一致，包括 IPv4 / IPv6
+try:
+    trace = opener.open("https://chatgpt.com/cdn-cgi/trace", timeout=15).read().decode()
+    exit_ip = next((l[3:] for l in trace.splitlines() if l.startswith("ip=")), "?")
+except Exception as e:
+    exit_ip = "error: " + str(e)[:60]
+check("直连出口与宿主机一致（%s）" % (os.environ.get("HOST_EXIT") or "宿主机未取到"), exit_ip, os.environ.get("HOST_EXIT") or "宿主机未取到")
 if os.environ.get("ACCOUNT_PROXY", "on").lower() != "off":
     # 查一个不存在的账号：能得到 account_not_found，说明 egress 连得上 sub2api、管理密钥有效
     got = route("relogin-selfcheck@example.invalid", "account")

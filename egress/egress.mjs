@@ -2,6 +2,8 @@
 // 并按「路由」把一次登录的流量接到该账号在 sub2api 里配置的代理上，让登录出口 IP 和日常使用一致。
 // 路由由 relogin 服务（凭令牌）按邮箱申请；账号代理的地址和密码只留在这个进程里，登录子进程看不到。
 import crypto from "node:crypto";
+import dgram from "node:dgram";
+import dns from "node:dns/promises";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -16,6 +18,8 @@ const ROUTE_TTL_MS = Number(process.env.EGRESS_ROUTE_TTL_SECONDS || 900) * 1000;
 const UPSTREAM_TIMEOUT_MS = 20_000;
 const LOOKUP_TIMEOUT_MS = 15_000;
 const TUNNEL_IDLE_MS = 600_000;
+// Go 的 net.Dialer 默认值：首选地址族连不上时，300ms 后并行尝试另一族
+const FALLBACK_DELAY_MS = 300;
 
 const ALLOWLIST = fs.readFileSync(ALLOWLIST_FILE, "utf8").split("\n")
   .map((line) => line.trim())
@@ -194,12 +198,75 @@ function connectTimeout(socket, ms) {
   return () => socket.setTimeout(0);
 }
 
+// 出站连接按 sub2api（Go 程序）的方式选 IPv4 / IPv6：
+// Go 按 RFC 6724 给解析结果排序——本机有到该 IPv6 地址的路由时 IPv6 排前面，否则 IPv4；
+// 然后先连首选族，300ms 没连上再并行连另一族。egress 跑在宿主机网络里，源地址和 sub2api 完全一样。
+const v6RouteCache = new Map();
+
+function hasRoute(address) {
+  const cached = v6RouteCache.get(address);
+  if (cached && cached.expires > Date.now()) return Promise.resolve(cached.ok);
+  return new Promise((resolve) => {
+    const socket = dgram.createSocket("udp6");
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      try { socket.close(); } catch {}
+      v6RouteCache.set(address, { ok, expires: Date.now() + 60_000 });
+      resolve(ok);
+    };
+    socket.on("error", () => done(false));
+    // UDP connect 不发包，只让内核选路由和源地址；没有 IPv6 路由会直接报错
+    socket.connect(443, address, (err) => {
+      if (err) return done(false);
+      try {
+        const local = socket.address().address;
+        done(Boolean(local) && local !== "::" && !/^fe80:/i.test(local));
+      } catch {
+        done(false);
+      }
+    });
+  });
+}
+
+async function orderedAddresses(host) {
+  if (net.isIP(host)) return [{ address: host, family: net.isIP(host) }];
+  const all = await dns.lookup(host, { all: true, order: "verbatim" });
+  const v6 = all.filter((a) => a.family === 6);
+  const v4 = all.filter((a) => a.family === 4);
+  const preferV6 = v6.length > 0 && await hasRoute(v6[0].address);
+  return preferV6 ? [...v6, ...v4] : [...v4, ...v6];
+}
+
+async function dial(host, port, useTls) {
+  const addresses = await orderedAddresses(host);
+  if (addresses.length === 0) throw new Error(`cannot resolve ${host}`);
+  const options = {
+    host,
+    port,
+    // 按上面排好的顺序交给 Node 的 Happy Eyeballs（首个地址族优先，间隔 300ms 换族）
+    lookup: (_name, opts, callback) => {
+      if (opts?.all) callback(null, addresses);
+      else callback(null, addresses[0].address, addresses[0].family);
+    },
+    autoSelectFamily: true,
+    autoSelectFamilyAttemptTimeout: FALLBACK_DELAY_MS,
+  };
+  return useTls
+    ? tls.connect({ ...options, servername: net.isIP(host) ? undefined : host })
+    : net.connect(options);
+}
+
 // 经 HTTP(S) 代理开隧道：发 CONNECT，读到响应头为止，返回已打通的 socket 和多读到的字节。
 function tunnelViaHttp(up, host, port) {
-  return new Promise((resolve, reject) => {
-    const socket = up.protocol === "https"
-      ? tls.connect({ host: up.host, port: up.port, servername: net.isIP(up.host) ? undefined : up.host })
-      : net.connect({ host: up.host, port: up.port });
+  return new Promise(async (resolve, reject) => {
+    let socket;
+    try {
+      socket = await dial(up.host, up.port, up.protocol === "https");
+    } catch (err) {
+      return reject(err);
+    }
     const clear = connectTimeout(socket, UPSTREAM_TIMEOUT_MS);
     socket.once("error", reject);
     socket.once(up.protocol === "https" ? "secureConnect" : "connect", () => {
@@ -233,8 +300,13 @@ function tunnelViaHttp(up, host, port) {
 
 // 经 SOCKS5 代理开隧道（RFC 1928/1929）。目标一律按域名交给代理解析，DNS 也走代理那一侧。
 function tunnelViaSocks5(up, host, port) {
-  return new Promise((resolve, reject) => {
-    const socket = net.connect({ host: up.host, port: up.port });
+  return new Promise(async (resolve, reject) => {
+    let socket;
+    try {
+      socket = await dial(up.host, up.port, false);
+    } catch (err) {
+      return reject(err);
+    }
     const clear = connectTimeout(socket, UPSTREAM_TIMEOUT_MS);
     socket.once("error", reject);
     const useAuth = Boolean(up.username || up.password);
@@ -301,8 +373,13 @@ function tunnelViaSocks5(up, host, port) {
 }
 
 function tunnelDirect(host, port) {
-  return new Promise((resolve, reject) => {
-    const socket = net.connect({ host, port });
+  return new Promise(async (resolve, reject) => {
+    let socket;
+    try {
+      socket = await dial(host, port, false);
+    } catch (err) {
+      return reject(err);
+    }
     const clear = connectTimeout(socket, UPSTREAM_TIMEOUT_MS);
     socket.once("error", reject);
     socket.once("connect", () => {
@@ -341,6 +418,8 @@ async function handleConnect(req, client, head) {
     return refuse(client, 502, "Bad Gateway");
   }
   const upstream = tunnel.socket;
+  log({ event: "tunnel_open", target: `${host}:${port}`, via: up ? up.protocol : "direct",
+    family: upstream.remoteFamily, local: up ? undefined : upstream.localAddress });
   upstream.on("error", () => client.destroy());
   client.on("error", () => upstream.destroy());
   upstream.on("close", () => client.destroy());
@@ -373,6 +452,16 @@ server.on("connect", (req, client, head) => {
 });
 server.headersTimeout = 10_000;
 server.maxConnections = 64;
+// 在宿主机网络里监听内部网络网桥的地址；开机时网桥可能晚于本进程出现，等它就绪。
+let listenAttempts = 0;
+server.on("error", (err) => {
+  if (err.code === "EADDRNOTAVAIL" && ++listenAttempts < 120) {
+    setTimeout(() => server.listen(LISTEN_PORT, LISTEN_HOST), 1000);
+    return;
+  }
+  console.error(err);
+  process.exit(1);
+});
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   log({ event: "listening", host: LISTEN_HOST, port: LISTEN_PORT, rules: ALLOWLIST.length,
     account_proxy: Boolean(SUB2API_BASE_URL) });

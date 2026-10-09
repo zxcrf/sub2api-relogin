@@ -39,7 +39,9 @@ sub2api（凭证守护）
 relogin 容器 ── server.mjs ── 子进程 toSub2 protocol-login.mjs（密码 + TOTP 登录，Codex OAuth）
    │  内部网络 relogin-int，没有出网路由
    ▼
-egress 容器（egress.mjs，主机名白名单）
+   │  http://172.31.250.1:8888（内部网络网桥在宿主机上的地址）
+   ▼
+egress 容器（egress.mjs，主机名白名单；宿主机网络，和 sub2api 同一套路由和源地址）
    │  ① 按邮箱查 sub2api：账号 → 代理（Admin API Key，只读调用）
    │  ② 这次登录的隧道接到该账号的代理上；账号没配代理就从本机出口直连
    ▼
@@ -48,7 +50,7 @@ egress 容器（egress.mjs，主机名白名单）
 
 - **重登**：sub2api 发来邮箱、密码、TOTP 密钥；服务用 toSub2 走一遍官方网页登录 + 2FA + Codex OAuth（PKCE），把拿到的 `access_token / refresh_token / id_token` 等返回给 sub2api，sub2api 写回账号。一次大约 1–2 分钟。
 - **出口 IP 和日常使用一致**：OpenAI 可能比对 OAuth 登录时的 IP 和之后实际调用的 IP。sub2api 用某个账号时走的是该账号配置的代理，所以重登默认也走同一个代理：每次登录前，relogin 向 egress 申请一条「路由」，egress 按邮箱在 sub2api 里找到同名账号和它的代理，这次登录的所有隧道都经那个代理出去。
-  - 账号没配代理 → 本机出口直连（sub2api 用这个号时也是本机出口）。
+  - 账号没配代理 → 本机出口直连（sub2api 用这个号时也是本机出口）。egress 跑在宿主机网络里，**IPv4 / IPv6 的选择和 sub2api 一致**：按 Go 的默认规则，本机有到目标的 IPv6 路由就先走 IPv6，300ms 连不上再试 IPv4；源地址由同一张路由表决定。`check.sh` 会核对两者出口 IP 相同。
   - sub2api 里还没有这个账号（「2FA 登录导入」新号）→ 本机出口直连。导入后再给账号配代理，下次重登就会走代理。
   - 查不到（sub2api 不可达、密钥无效）或同名账号配了不同代理 → **登录直接失败**，不会悄悄退回本机出口。
   - 用的是代理的原始地址：不会像 toSub2 自带逻辑那样轮换代理会话号（`sid-…`），出口和 sub2api 用的是同一个会话。
@@ -60,6 +62,7 @@ egress 容器（egress.mjs，主机名白名单）
 
 - 密码、TOTP 密钥、拿到的令牌不离开本机，只发往 OpenAI。
 - relogin 容器没有出网路由，只能经 egress 代理出去；代理只放行 [`egress/allowlist`](egress/allowlist) 里的主机名、只放行 443 端口，其它一律 `403 Filtered`；不带有效路由的隧道一律 `407`。即使第三方代码想绕过代理直连，也连不出去（`check.sh` 会验证这一点）。经账号代理出去时，白名单照样生效（目标主机名在 egress 这一层检查）。
+- egress 用宿主机网络，但只监听内部网络网桥的地址，公网连不到；它不运行第三方代码。
 - sub2api 的 Admin API Key 和账号代理的地址、密码**只在 egress 容器里**。跑第三方代码的 relogin 容器只拿到「egress 地址 + 一次性路由号」，路由在登录结束后删除，最长 15 分钟过期。
 - toSub2 会下载并执行 OpenAI 的 Sentinel 脚本（遇到 Cloudflare 质询时还会执行 Cloudflare 的脚本），运行它们的 vm 沙箱可以逃逸。补丁 [`patches/0001`](patches/0001-strip-secrets-from-python-worker-env.patch) 让执行这些脚本的进程拿不到密码和 TOTP 环境变量。
 - toSub2 固定在审计过的提交，部署时校验压缩包哈希和打补丁后每个文件的哈希，不一致就停止。
@@ -83,7 +86,8 @@ egress 容器（egress.mjs，主机名白名单）
 | ranxi 版 sub2api | 后台有「凭证守护」页面（`/admin/token-guard`）。只在 **v2.10.1** 上验证过 |
 | sub2api 能访问 relogin 容器 | sub2api 用 **host 网络**或直接装在宿主机上：天然可达。sub2api 在普通 Docker 网络里：部署后执行 `docker network connect sub2api-relogin_relogin-int <sub2api 容器名>` |
 | sub2api 管理员 API Key | 「系统设置 → 管理员 API Key」生成。egress 用它按邮箱查账号的代理；不想用就设 `RELOGIN_ACCOUNT_PROXY=off`（登录一律走本机出口） |
-| egress 能访问 sub2api | sub2api 在本机：egress 经 `host.docker.internal` 访问，宿主机开了防火墙要放行 `172.31.249.0/24` 到 sub2api 端口（见部署第 5 步）。也可以填 sub2api 的公网地址 |
+| egress 能访问 sub2api | egress 在宿主机网络里，sub2api 在本机就用 `http://127.0.0.1:<端口>`；也可以填公网地址 |
+| sub2api 用宿主机网络 | 这样 egress 直连时才和 sub2api 同一个出口。sub2api 在 Docker 普通网络里时，它的 IPv6 取决于 Docker 的 IPv6 配置，可能和宿主机不同，`check.sh` 的出口一致性检查只核对宿主机 |
 | 账号开了 TOTP 2FA | 只支持「密码 + TOTP」登录；要邮箱验证码或绑定手机的账号会失败（见[失败码](#失败码与排错)） |
 
 ## 部署
@@ -99,13 +103,13 @@ cd /opt/sub2api-relogin
 
 **2.（可选）改网段**
 
-默认用两个网段：内部网络 `172.31.250.0/24`（relogin 固定在 `172.31.250.10`）和 egress 出网网络 `172.31.249.0/24`。先确认没被占用：
+默认内部网络 `172.31.250.0/24`：relogin 固定在 `172.31.250.10`，网桥（egress 监听处）是 `172.31.250.1`。先确认没被占用：
 
 ```sh
-ip route | grep -E '172\.31\.(249|250)\.' || echo "未被占用"
+ip route | grep 172.31.250 || echo "未被占用"
 ```
 
-被占用就 `cp .env.example .env` 改 `RELOGIN_SUBNET`、`RELOGIN_IP`、`RELOGIN_OUT_SUBNET`，后面所有地址跟着换。
+被占用就 `cp .env.example .env` 改 `RELOGIN_SUBNET`、`RELOGIN_IP`、`RELOGIN_GATEWAY`，后面所有地址跟着换。
 
 **3. 下载并校验 toSub2**
 
@@ -140,20 +144,18 @@ chmod 0400 /etc/sub2api-relogin/sub2api-admin-key
 
 ```sh
 # sub2api 在本机、监听 3200 端口（按实际端口改）
-SUB2API_BASE_URL=http://host.docker.internal:3200
-```
-
-sub2api 只监听 `127.0.0.1` 时，egress 从容器里连不到它，改填它的公网地址（如 `https://sub2api.example.com`）。
-
-宿主机开了防火墙（`ufw status` 显示 `active`）时，放行 egress 的网段到 sub2api 端口，否则第 7 步会报「egress 能用管理密钥查 sub2api 账号」失败：
-
-```sh
-ufw allow from 172.31.249.0/24 to any port 3200 proto tcp comment 'sub2api-relogin egress -> sub2api'
+SUB2API_BASE_URL=http://127.0.0.1:3200
 ```
 
 不想按账号代理登录：`.env` 里写 `RELOGIN_ACCOUNT_PROXY=off`，跳过这一步（不用密钥文件）。
 
 **6. 构建并启动**
+
+宿主机开了防火墙（`ufw status` 显示 `active`）时，先放行 relogin 访问网桥上的 egress，否则第 7 步「egress 发放直连路由」会失败：
+
+```sh
+ufw allow from 172.31.250.0/24 to 172.31.250.1 port 8888 proto tcp comment 'sub2api-relogin -> egress'
+```
 
 ```sh
 docker compose up -d --build
@@ -257,7 +259,7 @@ HTTP 层面的错误：
 | `RELOGIN_SUBNET` | `172.31.250.0/24` | 内部网络网段 |
 | `RELOGIN_IP` | `172.31.250.10` | relogin 容器地址，sub2api 用它访问 |
 | `RELOGIN_TOKEN_PATH` | `/etc/sub2api-relogin/token` | 宿主机上的令牌文件 |
-| `RELOGIN_OUT_SUBNET` | `172.31.249.0/24` | egress 出网网络网段（防火墙放行用） |
+| `RELOGIN_GATEWAY` | `172.31.250.1` | 内部网络网桥地址，egress 监听在这里 |
 | `SUB2API_BASE_URL` | 空 | sub2api 地址，egress 用它查账号代理 |
 | `SUB2API_ADMIN_KEY_PATH` | `/etc/sub2api-relogin/sub2api-admin-key` | 宿主机上的管理员 API Key 文件 |
 | `RELOGIN_ACCOUNT_PROXY` | `on` | `on`：走账号配置的代理；`off`：一律本机出口直连，不查 sub2api |
@@ -287,7 +289,7 @@ HTTP 层面的错误：
 
 **`GET /healthz`**（不需要令牌）→ `{"ok":true,"running":0}`
 
-egress（只在内部网络里可达，供 relogin 和 `check.sh` 使用）：
+egress（监听 `172.31.250.1:8888`，只有内部网络里的 relogin 连得到，供它和 `check.sh` 使用）：
 
 - `POST /routes`，`Authorization: Bearer <令牌>`，`{"email":"a@example.com","mode":"account"}`（`mode` 为 `direct` 时不查 sub2api）→ `{"route":"<32 位十六进制>","mode":"account_proxy"|"direct","reason":"…","via":{"protocol","host","port"}|null}`
 - `DELETE /routes/<路由号>`
