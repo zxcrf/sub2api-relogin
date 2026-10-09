@@ -1,0 +1,52 @@
+# sub2api 自托管重登服务。relogin 在无出网路由的内部网络里，只能经 egress（主机名白名单代理）访问 OpenAI。
+# sub2api（host 网络）经 http://172.31.250.10:18790 调用。
+name: sub2api-relogin
+services:
+  relogin:
+    build: .
+    image: sub2api-relogin:local
+    restart: unless-stopped
+    networks:
+      relogin-int:
+        ipv4_address: 172.31.250.10
+    environment:
+      RELOGIN_LISTEN_HOST: 0.0.0.0
+      RELOGIN_LISTEN_PORT: "18790"
+      RELOGIN_TOKEN_FILE: /run/secrets/relogin-token
+      RELOGIN_EGRESS_PROXY: http://egress:8888
+      RELOGIN_MAX_CONCURRENT: "2"
+      RELOGIN_TIMEOUT_SECONDS: "600"
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - /etc/sub2api-relogin/token:/run/secrets/relogin-token:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    cpus: 1
+    pids_limit: 256
+    depends_on: [egress]
+  egress:
+    build: ./egress
+    image: sub2api-relogin-egress:local
+    restart: unless-stopped
+    networks:
+      relogin-int:
+        ipv4_address: 172.31.250.2
+      relogin-out: {}
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+    cpus: 0.5
+networks:
+  relogin-int:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+  relogin-out: {}
